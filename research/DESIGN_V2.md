@@ -16,12 +16,13 @@ last_updated: 2026-08-08
 
 Selene is a proposed idiomatic Rust rewrite of [[helio]], the C++17 fiber-and-proactor
 backend framework underneath [[dragonfly|DragonflyDB]]. The central claim of this document
-is that **a rewrite should not be a port**: roughly 90% of helio's ~74k lines exist because
-C++17 has no `async`/`await`, no cargo, and no networking ecosystem, and every one of those
-lines has a maintained crate behind it. Selene is the ~10% that is actually load-bearing,
-sitting on the [[blazingly-fast-rust-crate-stack|Rust crate stack]] for everything else.
+is that **a rewrite should not be a port**: most of helio's ~74k lines exist because
+C++17 has no `async`/`await`, no cargo, and no networking ecosystem, and nearly every one of
+those lines has a maintained crate behind it. Selene is the part that is actually
+load-bearing, sitting on the [[blazingly-fast-rust-crate-stack|Rust crate stack]] for
+everything else.
 
-Target: **one crate, ~4–5k lines**, replacing ~45k lines of hand-written non-test C++.
+Target: **one crate**, replacing ~45k lines of hand-written non-test C++.
 
 ## 1. What helio actually is, and why it is that big
 
@@ -89,8 +90,8 @@ Per [[shard-per-core-runtimes-compared]], [[compio]] is the standing recommendat
 Compio's per-operation boxing is the one loss against monoio's slab; [[apache-iggy]] measured
 it as negligible under [[mimalloc]], which Selene uses as its `#[global_allocator]` anyway.
 Glommio's proportional-share scheduler is the only thing Selene genuinely wants from another
-runtime, and §3.2 shows it can be rebuilt above the runtime in ~150 lines rather than by
-adopting an unmaintained one.
+runtime, and §3.2 shows it can be rebuilt above the runtime rather than by adopting an
+unmaintained one.
 
 **No abstraction layer over the runtime.** A trait with one implementation is a maintenance
 tax for a swap that may never happen. If compio has to go, that is a mechanical refactor of
@@ -112,7 +113,7 @@ Connections are born on the shard that will serve them.
 - Traversal (list clients, kill clients) → send a message to each shard; each walks its own
   `Slab<ConnHandle>` **on its own thread**. Zero atomics, zero protocol.
 - Migration → if rebalancing ever proves necessary, send the raw fd over a channel and
-  re-register on the target shard. ~30 lines. Measure before building it.
+  re-register on the target shard. Measure before building it.
 
 The 64-bit split-counter protocol, its starvation-avoidance asymmetry, and the header comment
 explaining both are deleted outright. This is the shape of most of Selene's wins: the
@@ -125,14 +126,14 @@ selene/
   Cargo.toml              features: tls, admin (both default)
   src/
     lib.rs
-    shard.rs     ~400   shard pool, pinning, fan-out, graceful shutdown
-    listener.rs  ~200   SO_REUSEPORT accept, Service trait, conn registry
-    budget.rs    ~150   background priority / warrant scheduling
-    watchdog.rs  ~80    stall detection + backtrace dump
-    admin.rs     ~300   control-plane tokio runtime: axum, metrics, pprof
-    uring.rs     ~?     raw opcodes only if compio lacks a feature (see §7)
-  examples/      ~600   echo, ping (RESP), tls_echo
-  tests/         ~1000  ported Python integration tests
+    shard.rs      shard pool, pinning, fan-out, graceful shutdown
+    listener.rs   SO_REUSEPORT accept, Service trait, conn registry
+    budget.rs     background priority / warrant scheduling
+    watchdog.rs   stall detection + backtrace dump
+    admin.rs      control-plane tokio runtime: axum, metrics, pprof
+    uring.rs      raw opcodes only if compio lacks a feature (see §7)
+  examples/       echo, ping (RESP), tls_echo
+  tests/          ported Python integration tests
 ```
 
 One crate. Feature flags, not sub-crates — a workspace split is warranted when compile times
@@ -191,8 +192,8 @@ loop {
 - **over warrant** → `yield_now().await`;
 - **over warrant and foreground active in the last 5 ms** → sleeps `min(1.5 ms, last chunk)`.
 
-Same policy, ~150 lines, no runtime fork, and the yield points are visible in the source
-instead of implicit at every fiber suspension.
+Same policy, no runtime fork, and the yield points are visible in the source instead of
+implicit at every fiber suspension.
 
 Two helio concepts die here. `FiberAtomicGuard` — the no-preempt marker that logs `DFATAL`
 with a stack trace if you suspend inside it — is unnecessary, because code between `.await`
@@ -211,8 +212,8 @@ dumps.
 
 Selene has no fiber stacks to decode. A watchdog thread samples a per-shard `AtomicU64`
 heartbeat; if a shard has not ticked in N ms it signals that thread and captures a backtrace
-via the `pprof` crate. ~80 lines, replaces 535 + the in-process dumper, and works the same in
-a core dump because it is just a thread backtrace.
+via the `pprof` crate. Replaces all 535 lines plus the in-process dumper, and works the same
+in a core dump because it is just a thread backtrace.
 
 ### 3.4 The Service trait
 
@@ -235,23 +236,24 @@ fine here, because the shard is generic over `S: Service` and never needs `dyn`.
 
 ## 4. The deletion table
 
-| Helio | Lines | Selene | Est. |
-|---|---:|---|---:|
-| `util/fibers/` — scheduler, proactors, fiber_interface, sync | 14,292 | [[compio]] + `shard.rs` + `budget.rs` | ~550 |
-| `base/` (≈16k vendored SIMD/utility headers) | 26,080 | [[bytes]], [[crossbeam-array-queue]], [[hdrhistogram]], [[quanta]], [[tracing]], [[foldhash]], [[bumpalo]], [[rustix]], [[socket2]] | ~0 |
-| `util/http/` — Beast, AsioStreamAdapter, status pages | 8,041 | axum on the control plane | ~300 |
-| `util/tls/` — BIO-pair engine, TlsSocket, async req machinery | 5,438 | [[rustls]] via `compio-tls` | ~100 |
-| `util/cloud/` + `util/aws/` — two S3 stacks, GCS, Azure | 5,922 | `object_store` | ~0 |
-| `examples/` | 5,221 | echo, ping, tls_echo | ~600 |
-| `io/` — Source/Sink/Result/adapters/files | 2,369 | `std::io` + [[bytes]] + compio-fs | ~0 |
-| `cmake/` + `blaze.sh` + `install-dependencies.sh` | ~1,300 | `Cargo.toml` | ~40 |
-| `tools/gdb_fibers.py` | 535 | `watchdog.rs` | ~80 |
-| `strings/` | 489 | `humansize`, `percent-encoding` | ~0 |
-| `util/metrics/` + `varz` + `util/html/` | ~900 | `metrics` + `metrics-exporter-prometheus` | ~50 |
-| `tests/` (Python integration) | 1,007 | kept, ported | ~1,000 |
+| Helio | Lines | Selene |
+|---|---:|---|
+| `util/fibers/` — scheduler, proactors, fiber_interface, sync | 14,292 | [[compio]] + `shard.rs` + `budget.rs` |
+| `base/` (≈16k vendored SIMD/utility headers) | 26,080 | [[bytes]], [[crossbeam-array-queue]], [[hdrhistogram]], [[quanta]], [[tracing]], [[foldhash]], [[bumpalo]], [[rustix]], [[socket2]] |
+| `util/http/` — Beast, AsioStreamAdapter, status pages | 8,041 | axum on the control plane |
+| `util/tls/` — BIO-pair engine, TlsSocket, async req machinery | 5,438 | [[rustls]] via `compio-tls` |
+| `util/cloud/` + `util/aws/` — two S3 stacks, GCS, Azure | 5,922 | `object_store` |
+| `examples/` | 5,221 | echo, ping, tls_echo |
+| `io/` — Source/Sink/Result/adapters/files | 2,369 | `std::io` + [[bytes]] + compio-fs |
+| `cmake/` + `blaze.sh` + `install-dependencies.sh` | ~1,300 | `Cargo.toml` |
+| `tools/gdb_fibers.py` | 535 | `watchdog.rs` |
+| `strings/` | 489 | `humansize`, `percent-encoding` |
+| `util/metrics/` + `varz` + `util/html/` | ~900 | `metrics` + `metrics-exporter-prometheus` |
+| `tests/` (Python integration) | 1,007 | kept, ported |
 
-**≈74k tracked → ≈5k.** Stripping vendored code and tests from both sides for a fair
-comparison: **≈45k hand-written C++ → ≈4k Rust, about 9×.**
+Every row on the right is either a dependency or a module small enough to hold in one head.
+How small is not knowable until Phase 1 exists; §4.1 is the part of this that does not depend
+on guessing.
 
 ### 4.1 The honest caveat
 
