@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/cli"]
+default-members = ["crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Wyatt Gill <wyattgill01@outlook.com>"]
+edition = "2024"
+description = "rust-nix-template"
+readme = "README.md"
+repository = "https://github.com/wyattgill9/rust-nix-template"
+license = "MIT"
+
+[workspace.dependencies]
+
+# crane reads these for the deps-only/clippy/test derivations (no root [package] here).
+[workspace.metadata.crane]
+name = "rust-nix-template"
