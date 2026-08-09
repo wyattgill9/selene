@@ -1,5 +1,5 @@
 [package]
-name = "cli"
+name = "selene"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -8,4 +8,12 @@ readme.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+default = ["tls", "admin"]
+tls = []
+admin = []
+
 [dependencies]
+
+[lints]
+workspace = true

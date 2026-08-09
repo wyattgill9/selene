@@ -37,8 +37,8 @@
     in
     {
       packages = {
-        cli = mkCrate "cli";
-        default = mkCrate "cli";
+        selene = mkCrate "selene";
+        default = mkCrate "selene";
       };
 
       # `nix flake check` runs these plus treefmt (added by the treefmt-nix module).
