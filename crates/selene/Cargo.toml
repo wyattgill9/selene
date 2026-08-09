@@ -8,12 +8,21 @@ readme.workspace = true
 repository.workspace = true
 license.workspace = true
 
-[features]
-default = ["tls", "admin"]
-tls = []
-admin = []
-
 [dependencies]
+compio = { version = "0.19.1", features = ["runtime", "net", "io", "time", "bytes", "macros", "polling"] }
+core_affinity = "0.8.3"
+derive_more = { version = "2.1.1", features = ["display"] }
+flume = "0.12.0"
+slab = "0.4.12"
+socket2 = { version = "0.6.5", features = ["all"] }
+thiserror = "2.0.20"
+tracing = "0.1.44"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+bytes = "1.12.1"
+flume = "0.12.0"
+pretty_assertions = "1.4.1"
+tracing-subscriber = "0.3.23"

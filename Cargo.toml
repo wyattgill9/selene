@@ -12,8 +12,6 @@ readme = "README.md"
 repository = "https://github.com/wyattgill9/selene"
 license = "MIT"
 
-[workspace.dependencies]
-
 # DESIGN_V1 §6.2: no RefCell borrow held across .await.
 # DESIGN_V1 §3.2: the "never use std::mutex" social rule becomes a lint.
 [workspace.lints.clippy]
