@@ -9,7 +9,7 @@ sources:
   - "Raw/Rust/Shard-per-core Rust runtimes - Monoio, Compio, and Glommio compared.md"
   - "Raw/Rust/The blazingly fast Rust crate stack for 2025–2026.md"
   - "helio repository map @ 145a679 (supplied in-session, not in Raw/)"
-last_updated: 2026-08-08
+last_updated: 2026-08-09
 ---
 
 # Selene — Design Doc
@@ -48,29 +48,40 @@ does not have.
 
 ## 2. Architecture
 
-Two planes, two runtimes. This is the one structural departure from helio, and it is what
-buys the ecosystem back.
+Two planes. Selene owns one of them. This is the one structural departure from helio, and it
+is what buys the ecosystem back.
 
 ```
-┌─ shard 0 … N-1  ([[compio]], pinned, !Send) ────────────────┐
-│  SO_REUSEPORT listener → connection tasks → shard state    │   DATA PLANE
-│  thread-local counters, RefCell state, no Arc, no Mutex    │   hot, io_uring
-└──────────────────────────┬─────────────────────────────────┘
-                           │  flume channel, cold path only
-┌──────────────────────────▼─────────────────────────────────┐
-│  control runtime ([[tokio]] multi_thread, 1–2 threads)      │   CONTROL PLANE
-│  axum: /metrics /healthz /pprof   ·  object_store: snapshots│   cold, epoll
-│  hickory-resolver: DNS            ·  tracing-subscriber      │
+┌─ SELENE ────────────────────────────────────────────────────┐
+│  shard 0 … N-1  ([[compio]], pinned, !Send)                 │   DATA PLANE
+│  SO_REUSEPORT listener → connection tasks → shard state     │   hot, io_uring
+│  thread-local counters, RefCell state, no Arc, no Mutex     │
+└──────────────────────────┬──────────────────────────────────┘
+                           │  stats(), affinity()  ·  §2.3
+┌──────────────────────────▼──────────────────────────────────┐
+│  APPLICATION-OWNED [[tokio]] runtime                        │   CONTROL PLANE
+│  axum: /metrics /healthz /pprof   · object_store: snapshots │   cold, epoll
+│  hickory-resolver: DNS            · tracing-subscriber      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 Helio puts its HTTP admin server on the same proactors as the data path, which is why it
-needed `AsioStreamAdapter` to make Beast speak fiber-socket. Selene puts admin, metrics, DNS
-and cloud storage on a small boring tokio runtime and lets them use the whole tokio
-ecosystem unmodified. The data plane never touches it except to hand over a stats snapshot.
-Cost: two extra threads and one channel hop on a cold path. Benefit: `util/http`,
-`util/cloud`, `util/aws`, `util/metrics` and `util/html` all become dependencies rather than
-source — 19,885 lines deleted for the price of a `flume::Sender`.
+needed `AsioStreamAdapter` to make Beast speak fiber-socket. Selene's departure is that cold
+work does not run on a shard at all. It runs on an ordinary tokio runtime, where the whole
+ecosystem works unmodified.
+
+Selene does not host that runtime. The application builds it, sizes it, and owns its
+lifecycle, because the load-bearing tenant is the application's: snapshot upload to S3 is a
+multipart, retrying, TLS-to-arbitrary-endpoint operation, and writing it on compio is
+precisely the 5,922 lines of `util/cloud` + `util/aws` this document is deleting. Everything
+else that was going to live there is small. `/healthz` is answerable by RESP `PING`, `pprof`
+samples from its own signal-driven thread, and DNS is `getaddrinfo` on a spawned thread.
+
+So `util/http`, `util/cloud`, `util/aws`, `util/metrics` and `util/html` become dependencies
+rather than source, 19,885 lines deleted. They die because the application depends on axum
+and `object_store` directly, not because Selene hosts the runtime they run on. Hosting was
+never the mechanism, and a library that spawns no threads of its own cannot contend with its
+own shards for cores.
 
 ### 2.1 Runtime choice: compio
 
@@ -119,25 +130,60 @@ The 64-bit split-counter protocol, its starvation-avoidance asymmetry, and the h
 explaining both are deleted outright. This is the shape of most of Selene's wins: the
 complexity was downstream of a structural choice, not inherent to the problem.
 
+### 2.3 The seam
+
+Selene owns per-shard counters and the CPU set the shards claimed, so those are the only two
+things it has to expose across the plane boundary:
+
+```rust
+impl<S: Service> Shards<S> {
+    /// Gather per-shard counters. Callable from any thread, any runtime.
+    pub async fn stats(&self) -> Vec<ShardStats>;
+    /// CPUs the shards claimed, so the caller can keep its own threads off them.
+    pub fn affinity(&self) -> &CpuSet;
+}
+```
+
+`stats()` is the `flume` round trip: one message per shard, each shard reads its own
+thread-locals on its own thread, results gathered by the caller. `affinity()` exists because
+the application's runtime is a scheduling peer of the shards, and it should either avoid
+those CPUs or run at `SCHED_IDLE` so it only gets the slack that io_uring waits already
+create.
+
+The admission rule for anything else: **if it can run late without a client noticing, it does
+not belong on a shard.** That is a latency test, not a subject-matter one.
+
+Shutdown runs in the order the application chooses, and the order matters: the control plane
+has to outlive the shards, because a snapshot drain is still uploading after the last
+connection closes. Selene's `Shards` handle is droppable independently of the tokio runtime
+precisely so the application can sequence that.
+
 ## 3. Module layout
 
 ```
 selene/
-  Cargo.toml              features: tls, admin (both default)
+  Cargo.toml              features: tls (default)
   src/
     lib.rs
-    shard.rs      shard pool, pinning, fan-out, graceful shutdown
+    shard.rs      shard pool, pinning, fan-out, graceful shutdown, stats()
     listener.rs   SO_REUSEPORT accept, Service trait, conn registry
     budget.rs     background priority / warrant scheduling
     watchdog.rs   stall detection + backtrace dump
-    admin.rs      control-plane tokio runtime: axum, metrics, pprof
     uring.rs      raw opcodes only if compio lacks a feature (see §7)
-  examples/       echo, ping (RESP), tls_echo
+  examples/       echo, ping (RESP), tls_echo, admin
   tests/          ported Python integration tests
 ```
 
 One crate. Feature flags, not sub-crates — a workspace split is warranted when compile times
 or independent versioning demand it, and neither does yet (see [[rust-workspace-patterns]]).
+
+`admin` is an example, not a module. It is the control-plane wiring from §2.3 (tokio runtime,
+axum, `metrics-exporter-prometheus`, a `pprof` handler, a `/metrics` handler that calls
+`stats()`) written once so the seam is demonstrated and exercised in CI. Shipping it as a
+library module would put tokio and axum in the default dependency graph of every consumer to
+serve a single caller, which is rule 6.3 with extra steps. An application that wants it copies
+it and is then free to modify it. Promote it to a feature-gated module when a second consumer
+wants the identical wiring.
 
 ### 3.1 The shard pool
 
@@ -240,7 +286,7 @@ fine here, because the shard is generic over `S: Service` and never needs `dyn`.
 |---|---:|---|
 | `util/fibers/` — scheduler, proactors, fiber_interface, sync | 14,292 | [[compio]] + `shard.rs` + `budget.rs` |
 | `base/` (≈16k vendored SIMD/utility headers) | 26,080 | [[bytes]], [[crossbeam-array-queue]], [[hdrhistogram]], [[quanta]], [[tracing]], [[foldhash]], [[bumpalo]], [[rustix]], [[socket2]] |
-| `util/http/` — Beast, AsioStreamAdapter, status pages | 8,041 | axum on the control plane |
+| `util/http/` — Beast, AsioStreamAdapter, status pages | 8,041 | axum, in the application (`examples/admin`) |
 | `util/tls/` — BIO-pair engine, TlsSocket, async req machinery | 5,438 | [[rustls]] via `compio-tls` |
 | `util/cloud/` + `util/aws/` — two S3 stacks, GCS, Azure | 5,922 | `object_store` |
 | `examples/` | 5,221 | echo, ping, tls_echo |
@@ -248,7 +294,7 @@ fine here, because the shard is generic over `S: Service` and never needs `dyn`.
 | `cmake/` + `blaze.sh` + `install-dependencies.sh` | ~1,300 | `Cargo.toml` |
 | `tools/gdb_fibers.py` | 535 | `watchdog.rs` |
 | `strings/` | 489 | `humansize`, `percent-encoding` |
-| `util/metrics/` + `varz` + `util/html/` | ~900 | `metrics` + `metrics-exporter-prometheus` |
+| `util/metrics/` + `varz` + `util/html/` | ~900 | `metrics` in Selene; `metrics-exporter-prometheus` in the application |
 | `tests/` (Python integration) | 1,007 | kept, ported |
 
 Every row on the right is either a dependency or a module small enough to hold in one head.
@@ -355,9 +401,10 @@ jump-attribution histogram and a 500 µs task budget; a generic loop is not obvi
 shutdown, tracing, `budget.rs`, `watchdog.rs`. Port `ping_iouring_server` (RESP). Gate: match
 helio's ping benchmark.
 
-**Phase 2 — TLS and control plane.** rustls via compio-tls; tokio control runtime with axum,
-`metrics-exporter-prometheus`, and a `pprof` handler. Gate: TLS echo parity, and a `/metrics`
-scrape that does not move shard p99.
+**Phase 2 — TLS and the seam.** rustls via compio-tls; `stats()` and `affinity()`; the
+`admin` example (tokio runtime, axum, `metrics-exporter-prometheus`, `pprof` handler). Gate:
+TLS echo parity, and a `/metrics` scrape driven through `stats()` that does not move shard
+p99 while the control runtime is unpinned and competing for the same cores.
 
 **Phase 3 — cold path.** `object_store` snapshots, `hickory-resolver`, port the Python
 integration tests (they drive binaries, so they port nearly unchanged). Build the
@@ -379,19 +426,21 @@ CI collapses from 5 configs × 2 arches of cmake matrix to `cargo nextest`, `car
 |---|---|
 | Compio underperforms helio's hand-tuned loop | Phase 0 gate; escape hatch is a custom executor over compio's driver, which the split was designed for |
 | io_uring cancellation UAF | Rule 6.1, enforced by lint and review |
-| Two runtimes in one process | Real but small: two timer wheels, more threads. Buys the entire tokio ecosystem for the cold path |
+| Application runs its tokio runtime on shard cores | `affinity()` reports the claimed CPU set; the `admin` example demonstrates `SCHED_IDLE`. Note the split still improves on helio here: a slow scrape preempts a shard instead of cooperatively stalling it, as it does when admin shares a proactor |
+| Two runtimes in one process | Two timer wheels and a few more threads, none of them Selene's. The Phase 2 gate measures the p99 cost |
 | Background policy less faithful than helio's | Cooperative either way — a background chunk that never awaits stalls a helio fiber too. Parity, not regression |
 | Compio bus factor | Lateral move (§4.1); driver is small enough to fork |
 | Container seccomp blocks io_uring | Same exposure as helio's `--force_epoll`; must be a CI job |
-| Ecosystem gaps on compio | Sidestepped by design: anything needing the tokio ecosystem lives on the control plane |
+| Ecosystem gaps on compio | Sidestepped by design: anything needing the tokio ecosystem lives on the application's control plane (§2.3) |
 
 ## 9. Not doing
 
 No cloud storage clients. No custom logging facade. No `-fno-builtin-malloc` dance —
 [[mimalloc]] as `#[global_allocator]`. No SIMD translation shims, no cuckoo map, no varint
 encoder, no SSO string view, no fixed-capacity callable type. No runtime abstraction trait.
-No built-in HTML status page in v1 — Grafana reads `/metrics`; add one when somebody actually
-asks. No PGO plumbing in the build; `cargo-pgo` when a benchmark justifies it
+No control plane in the library: Selene exposes `stats()` and `affinity()` and the
+application brings its own tokio runtime (§2.3). No built-in HTML status page in v1 — Grafana
+reads `/metrics`; add one when somebody actually asks. No PGO plumbing in the build; `cargo-pgo` when a benchmark justifies it
 ([[cargo-profile-optimization]]).
 
 ## 10. Open questions
